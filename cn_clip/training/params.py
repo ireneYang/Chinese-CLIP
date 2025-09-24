@@ -224,8 +224,20 @@ def parse_args():
         default=0.5,
         help="Weight of KD loss."
     )
+    # DeepSpeed 相关的参数
+    parser.add_argument('--deepspeed', action='store_true', help='Enable DeepSpeed training.')
+    parser.add_argument('--deepspeed_config', type=str, default=None,
+                        help='Path to DeepSpeed config file. Default to Chinese-CLIP/configs/ds_config.json if --deepspeed is enabled and this is not specified.')
+
     args = parser.parse_args()
     args.aggregate = not args.skip_aggregate
+
+    # 自动设置 DeepSpeed 配置路径
+    if args.deepspeed and args.deepspeed_config is None:
+        import os
+        args.deepspeed_config = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../configs/ds_config.json")
+        if not os.path.exists(args.deepspeed_config):
+            raise FileNotFoundError(f"DeepSpeed config file not found at default path: {args.deepspeed_config}")
 
     # If some params are not passed, we use the default values based on model name.
     default_params = get_default_params(args.vision_model)

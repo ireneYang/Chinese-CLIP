@@ -13,6 +13,14 @@ import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 from torch.cuda.amp import GradScaler
 
+# DeepSpeed import
+try:
+    import deepspeed
+    DEEPSPEED_AVAILABLE = True
+except ImportError:
+    DEEPSPEED_AVAILABLE = False
+    deepspeed = None
+
 from cn_clip.clip import load
 from cn_clip.clip.model import convert_weights, convert_state_dict, resize_pos_embed, CLIP
 from cn_clip.training.train import train, evaluate
@@ -52,9 +60,18 @@ def main():
     torch.cuda.set_device(args.local_device_rank)
     args.device = torch.device("cuda", args.local_device_rank)
 
-    dist.init_process_group(backend="nccl")
-    args.rank = dist.get_rank()
-    args.world_size = dist.get_world_size()
+    if args.deepspeed:
+        # DeepSpeed 模式：DeepSpeed 会自动处理分布式初始化
+        if not DEEPSPEED_AVAILABLE:
+            raise ImportError("DeepSpeed is not available. Please install it with: pip install deepspeed")
+        # DeepSpeed 会在 deepspeed.initialize 时处理分布式初始化
+        # 这里我们先设置一些基本信息，稍后在模型初始化后调用 deepspeed.initialize
+        pass
+    else:
+        # 原有的 PyTorch DDP 模式
+        dist.init_process_group(backend="nccl")
+        args.rank = dist.get_rank()
+        args.world_size = dist.get_world_size()
 
     # Set output path
     time_suffix = strftime("%Y-%m-%d-%H-%M-%S", gmtime())
@@ -129,13 +146,15 @@ def main():
                     m.eval()
         logging.info("The visual encoder is freezed during training.")
 
-    # To make compatible with torch version <= 1.8.0, set find_unused_parameters to True
-    # In other cases, set find_unused_parameters to False
-    find_unused_parameters = torch_version_str_compare_lessequal(torch.__version__, "1.8.0")
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_device_rank], find_unused_parameters=find_unused_parameters)
-    # Have to set this when activating grad checkpointing in Pytorch >= 2.0.0
-    if args.grad_checkpointing and not torch_version_str_compare_lessequal(torch.__version__, "1.14.0"):
-        model._set_static_graph()
+    if not args.deepspeed:
+        # 原有的 PyTorch DDP 模式
+        # To make compatible with torch version <= 1.8.0, set find_unused_parameters to True
+        # In other cases, set find_unused_parameters to False
+        find_unused_parameters = torch_version_str_compare_lessequal(torch.__version__, "1.8.0")
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_device_rank], find_unused_parameters=find_unused_parameters)
+        # Have to set this when activating grad checkpointing in Pytorch >= 2.0.0
+        if args.grad_checkpointing and not torch_version_str_compare_lessequal(torch.__version__, "1.14.0"):
+            model._set_static_graph()
 
     if args.precision == "fp16":
         convert_weights(model)
@@ -173,7 +192,37 @@ def main():
         total_steps = args.max_steps
         scheduler = cosine_lr(optimizer, args.lr, args.warmup, total_steps)
 
-    scaler = GradScaler() if args.precision == "amp" else None
+    if args.deepspeed:
+        # DeepSpeed 模式：初始化 DeepSpeed 引擎
+        # 读取 DeepSpeed 配置文件
+        if args.deepspeed_config:
+            with open(args.deepspeed_config, 'r') as f:
+                ds_config = json.load(f)
+        else:
+            # 如果没有指定配置文件，DeepSpeed 会使用默认配置
+            ds_config = None
+            logging.warning("DeepSpeed is enabled but no config file specified. Using default DeepSpeed config.")
+
+        model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
+            model=model,
+            optimizer=optimizer, # 传入 PyTorch 优化器
+            lr_scheduler=scheduler, # 传入 PyTorch 学习率调度器
+            config_params=ds_config,
+            args=args # 传入 args 以便 DeepSpeed 获取相关参数
+        )
+        model = model_engine # 使用 DeepSpeed 包装后的模型
+        optimizer = optimizer # 使用 DeepSpeed 包装后的优化器
+        scheduler = lr_scheduler # 使用 DeepSpeed 包装后的调度器
+        scaler = None # DeepSpeed 会自动处理混合精度，不需要 GradScaler
+        
+        # DeepSpeed 初始化后，获取分布式信息
+        args.rank = dist.get_rank()
+        args.world_size = dist.get_world_size()
+        logging.info("DeepSpeed initialized.")
+    else:
+        # 原有的 PyTorch DDP 模式
+        scaler = GradScaler() if args.precision == "amp" else None
+        logging.info("PyTorch DDP initialized.")
 
     # Log and save hyper-params.
     if is_master(args):
@@ -208,31 +257,49 @@ def main():
             logging.info(
                 f"=> begin to load checkpoint '{args.resume}'"
             )
-            # Restore the model weight, map model to be loaded to specified single gpu.
-            # loc = "cuda:{}".format(args.local_device_rank)
-            checkpoint = torch.load(args.resume, map_location="cpu")
-            sd = {k: v for k, v in checkpoint["state_dict"].items() if "bert.pooler" not in k}
-            # Resize the positional embedding by interpolation, if needed
-            resize_pos_embed(sd, model, prefix="module.")
-            # Adapt flash attention
-            if args.use_flash_attention:
-                sd = convert_state_dict(sd)
-            # Load the state dict
-            model.load_state_dict(sd)
-            # Restore the epoch and steps info, reload the dataset and dataloader for the resume epoch
-            if not args.reset_data_offset:
-                start_epoch = checkpoint["epoch"]
-                steps = checkpoint["step"]
-                data = get_data(args, 
-                                epoch_id=start_epoch, 
-                                max_txt_length=args.context_length)
-            # Restore the optim state
-            if not args.reset_optimizer and optimizer is not None:
-                optimizer.load_state_dict(checkpoint["optimizer"])
-                logging.info("=> optimizer state is restored from the checkpoint")
-            logging.info(
-                f"=> loaded checkpoint '{args.resume}' (epoch {checkpoint['epoch']} @ {steps} steps)"
-            )
+            
+            if args.deepspeed:
+                # DeepSpeed checkpoint loading
+                # For DeepSpeed, we need to load the checkpoint using DeepSpeed's API
+                # The model_engine will handle loading model, optimizer, and lr_scheduler states
+                _, client_state = model.load_checkpoint(args.resume)
+                if client_state is not None:
+                    start_epoch = client_state.get("epoch", 0)
+                    steps = client_state.get("step", 0)
+                    if not args.reset_data_offset:
+                        data = get_data(args, 
+                                        epoch_id=start_epoch, 
+                                        max_txt_length=args.context_length)
+                logging.info(
+                    f"=> loaded DeepSpeed checkpoint '{args.resume}' (epoch {start_epoch} @ {steps} steps)"
+                )
+            else:
+                # Original PyTorch checkpoint loading
+                # Restore the model weight, map model to be loaded to specified single gpu.
+                # loc = "cuda:{}".format(args.local_device_rank)
+                checkpoint = torch.load(args.resume, map_location="cpu")
+                sd = {k: v for k, v in checkpoint["state_dict"].items() if "bert.pooler" not in k}
+                # Resize the positional embedding by interpolation, if needed
+                resize_pos_embed(sd, model, prefix="module.")
+                # Adapt flash attention
+                if args.use_flash_attention:
+                    sd = convert_state_dict(sd)
+                # Load the state dict
+                model.load_state_dict(sd)
+                # Restore the epoch and steps info, reload the dataset and dataloader for the resume epoch
+                if not args.reset_data_offset:
+                    start_epoch = checkpoint["epoch"]
+                    steps = checkpoint["step"]
+                    data = get_data(args, 
+                                    epoch_id=start_epoch, 
+                                    max_txt_length=args.context_length)
+                # Restore the optim state
+                if not args.reset_optimizer and optimizer is not None:
+                    optimizer.load_state_dict(checkpoint["optimizer"])
+                    logging.info("=> optimizer state is restored from the checkpoint")
+                logging.info(
+                    f"=> loaded checkpoint '{args.resume}' (epoch {checkpoint['epoch']} @ {steps} steps)"
+                )
         else:
             logging.info("=> no checkpoint found at '{}'".format(args.resume))
 
@@ -313,11 +380,53 @@ def main():
 
         # Saving checkpoints.
         if args.should_save and num_steps_this_epoch > 0:
-            if (epoch + 1) == args.max_epochs or (
-                args.save_epoch_frequency > 0 and ((epoch + 1) % args.save_epoch_frequency) == 0
-            ):
+            if args.deepspeed:
+                # DeepSpeed checkpoint saving
+                if (epoch + 1) == args.max_epochs or (
+                    args.save_epoch_frequency > 0 and ((epoch + 1) % args.save_epoch_frequency) == 0
+                ):
+                    t1 = time.time()
+                    save_path = os.path.join(args.checkpoint_path, f"epoch{epoch + 1}")
+                    client_state = {
+                        "epoch": epoch + 1,
+                        "step": steps,
+                        "name": args.name,
+                    }
+                    model.save_checkpoint(save_path, client_state=client_state)
+                    logging.info("Saved DeepSpeed checkpoint {} (epoch {} @ {} steps) (writing took {} seconds)".format(save_path, epoch + 1, steps, time.time() - t1))
+                
+                # Save the latest params
                 t1 = time.time()
-                save_path = os.path.join(args.checkpoint_path, f"epoch{epoch + 1}.pt")
+                save_path = os.path.join(args.checkpoint_path, f"epoch_latest")
+                client_state = {
+                    "epoch": epoch + 1,
+                    "step": steps,
+                    "name": args.name,
+                }
+                model.save_checkpoint(save_path, client_state=client_state)
+                logging.info("Saved DeepSpeed checkpoint {} (epoch {} @ {} steps) (writing took {} seconds)".format(save_path, epoch + 1, steps, time.time() - t1))
+            else:
+                # Original PyTorch checkpoint saving
+                if (epoch + 1) == args.max_epochs or (
+                    args.save_epoch_frequency > 0 and ((epoch + 1) % args.save_epoch_frequency) == 0
+                ):
+                    t1 = time.time()
+                    save_path = os.path.join(args.checkpoint_path, f"epoch{epoch + 1}.pt")
+                    torch.save(
+                        {
+                            "epoch": epoch + 1,
+                            "step": steps,
+                            "name": args.name,
+                            "state_dict": model.state_dict() if not args.use_flash_attention else convert_state_dict(model.state_dict()),
+                            "optimizer": optimizer.state_dict(),
+                        },
+                        save_path,
+                    )
+                    logging.info("Saved checkpoint {} (epoch {} @ {} steps) (writing took {} seconds)".format(save_path, epoch + 1, steps, time.time() - t1))
+                
+                # Save the latest params
+                t1 = time.time()
+                save_path = os.path.join(args.checkpoint_path, f"epoch_latest.pt")
                 torch.save(
                     {
                         "epoch": epoch + 1,
@@ -329,21 +438,6 @@ def main():
                     save_path,
                 )
                 logging.info("Saved checkpoint {} (epoch {} @ {} steps) (writing took {} seconds)".format(save_path, epoch + 1, steps, time.time() - t1))
-            
-            # Save the latest params
-            t1 = time.time()
-            save_path = os.path.join(args.checkpoint_path, f"epoch_latest.pt")
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "step": steps,
-                    "name": args.name,
-                    "state_dict": model.state_dict() if not args.use_flash_attention else convert_state_dict(model.state_dict()),
-                    "optimizer": optimizer.state_dict(),
-                },
-                save_path,
-            )
-            logging.info("Saved checkpoint {} (epoch {} @ {} steps) (writing took {} seconds)".format(save_path, epoch + 1, steps, time.time() - t1))
 
 
 if __name__ == "__main__":

@@ -170,7 +170,9 @@ def train(model, data, epoch, optimizer, scaler, scheduler, args, global_trained
         if step >= args.max_steps:
             logging.info("Stopping training due to step {} has reached max_steps {}".format(step, args.max_steps // args.accum_freq))
             return epoch_trained_steps
-        scheduler(step)
+        # 学习率调度器在 DDP 模式下手动调用，DeepSpeed 模式下自动处理
+        if not hasattr(args, 'deepspeed') or not args.deepspeed:
+            scheduler(step)
 
         optimizer.zero_grad()
 
@@ -182,84 +184,99 @@ def train(model, data, epoch, optimizer, scaler, scheduler, args, global_trained
 
         data_time = time.time() - end
 
-        m = model.module
+        m = model.module if hasattr(model, 'module') else model  # 兼容 DDP 和 DeepSpeed 包装的模型
 
-        if args.accum_freq == 1:
-            # with automatic mixed precision.
-            if args.precision == "amp":
-                with autocast():
-                    if args.distillation:
-                        total_loss, acc = get_loss(model, images, texts, loss_img, loss_txt, args, teacher_model=teacher_model)
-                    else:
-                        total_loss, acc = get_loss(model, images, texts, loss_img, loss_txt, args)
-                    scaler.scale(total_loss).backward()
-                    scaler.step(optimizer)
-                scaler.update()
-
-            else:
+        if hasattr(args, 'deepspeed') and args.deepspeed:
+            # DeepSpeed 模式：简化的训练循环
+            # DeepSpeed 会自动处理混合精度和梯度累积
+            with autocast(enabled=(args.precision == "amp")):
                 if args.distillation:
                     total_loss, acc = get_loss(model, images, texts, loss_img, loss_txt, args, teacher_model=teacher_model)
                 else:
                     total_loss, acc = get_loss(model, images, texts, loss_img, loss_txt, args)
-                total_loss.backward()
-                optimizer.step()
+            
+            model.backward(total_loss)  # DeepSpeed 反向传播
+            model.step()  # DeepSpeed 优化器步进，包含梯度累积和混合精度更新
         else:
-            # First, cache the features without any gradient tracking.
-            with torch.no_grad():
-                with autocast(enabled=(args.precision == "amp")):
-                    chunk_image_features, chunk_text_features, _ = model(images, texts)
-                if args.distillation:
-                    output = teacher_model.module.get_feature(images)
-                    if(len(output) == 2):
-                        teacher_chunk_image_features = output[0]
-                    else:
-                        teacher_chunk_image_features = output
-                accum_image_features.append(chunk_image_features)
-                accum_text_features.append(chunk_text_features)
-                if args.distillation:
-                    teacher_accum_image_features.append(teacher_chunk_image_features)
-
-                accum_images.append(images)
-                accum_texts.append(texts)
-
-            # If (i + 1) % accum_freq is not zero, move on to the next batch.
-            if ((i + 1) % args.accum_freq) > 0:
-                # FIXME this makes data time logging unreliable when accumulating
-                continue
-
-            # Now, ready to take gradients for the last accum_freq batches.
-            # Re-do the forward pass for those batches, and use the cached features from the other batches as negatives.
-            # Call backwards each time, but only step optimizer at the end.
-            optimizer.zero_grad()
-            for j in range(args.accum_freq):
-                images = accum_images[j]
-                texts = accum_texts[j]
-                with autocast(enabled=(args.precision == "amp")):
-                    # `total_loss` and `acc` are coarsely sampled, taking only the last result in the loop.
-                    # Although each result should be the same in theory, it will be slightly different in practice
-                    if args.distillation:
-                        total_loss, acc = get_loss(model, images, texts, loss_img, loss_txt, args, accum_image_features, accum_text_features, j, teacher_model, teacher_accum_image_features)
-                    else:
-                        total_loss, acc = get_loss(model, images, texts, loss_img, loss_txt, args, accum_image_features, accum_text_features, j)
+            # 原有的 PyTorch DDP 模式
+            if args.accum_freq == 1:
+                # with automatic mixed precision.
                 if args.precision == "amp":
-                    scaler.scale(total_loss).backward()
+                    with autocast():
+                        if args.distillation:
+                            total_loss, acc = get_loss(model, images, texts, loss_img, loss_txt, args, teacher_model=teacher_model)
+                        else:
+                            total_loss, acc = get_loss(model, images, texts, loss_img, loss_txt, args)
+                        scaler.scale(total_loss).backward()
+                        scaler.step(optimizer)
+                    scaler.update()
+
                 else:
+                    if args.distillation:
+                        total_loss, acc = get_loss(model, images, texts, loss_img, loss_txt, args, teacher_model=teacher_model)
+                    else:
+                        total_loss, acc = get_loss(model, images, texts, loss_img, loss_txt, args)
                     total_loss.backward()
-
-            if args.precision == "amp":
-                scaler.step(optimizer)
-                scaler.update()
+                    optimizer.step()
             else:
-                optimizer.step()
+                # First, cache the features without any gradient tracking.
+                with torch.no_grad():
+                    with autocast(enabled=(args.precision == "amp")):
+                        chunk_image_features, chunk_text_features, _ = model(images, texts)
+                    if args.distillation:
+                        output = teacher_model.module.get_feature(images)
+                        if(len(output) == 2):
+                            teacher_chunk_image_features = output[0]
+                        else:
+                            teacher_chunk_image_features = output
+                    accum_image_features.append(chunk_image_features)
+                    accum_text_features.append(chunk_text_features)
+                    if args.distillation:
+                        teacher_accum_image_features.append(teacher_chunk_image_features)
 
-        # reset gradient accum, if enabled
-        if args.accum_freq > 1:
+                    accum_images.append(images)
+                    accum_texts.append(texts)
+
+                # If (i + 1) % accum_freq is not zero, move on to the next batch.
+                if ((i + 1) % args.accum_freq) > 0:
+                    # FIXME this makes data time logging unreliable when accumulating
+                    continue
+
+                # Now, ready to take gradients for the last accum_freq batches.
+                # Re-do the forward pass for those batches, and use the cached features from the other batches as negatives.
+                # Call backwards each time, but only step optimizer at the end.
+                optimizer.zero_grad()
+                for j in range(args.accum_freq):
+                    images = accum_images[j]
+                    texts = accum_texts[j]
+                    with autocast(enabled=(args.precision == "amp")):
+                        # `total_loss` and `acc` are coarsely sampled, taking only the last result in the loop.
+                        # Although each result should be the same in theory, it will be slightly different in practice
+                        if args.distillation:
+                            total_loss, acc = get_loss(model, images, texts, loss_img, loss_txt, args, accum_image_features, accum_text_features, j, teacher_model, teacher_accum_image_features)
+                        else:
+                            total_loss, acc = get_loss(model, images, texts, loss_img, loss_txt, args, accum_image_features, accum_text_features, j)
+                    if args.precision == "amp":
+                        scaler.scale(total_loss).backward()
+                    else:
+                        total_loss.backward()
+
+                if args.precision == "amp":
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+
+        # reset gradient accum, if enabled (仅在 DDP 模式下需要手动重置)
+        if (not hasattr(args, 'deepspeed') or not args.deepspeed) and args.accum_freq > 1:
             accum_images, accum_texts, accum_image_features, accum_text_features = [], [], [], []
             if args.distillation:
                 teacher_accum_image_features = []
 
         # Note: we clamp to 4.6052 = ln(100), as in the original paper.
-        m.logit_scale.data = torch.clamp(m.logit_scale.data, 0, 4.6052)
+        # DeepSpeed 模式下，logit_scale 可能由 DeepSpeed 引擎管理，需要确认是否可以直接访问
+        if hasattr(m, 'logit_scale'):  # 确保 logit_scale 存在
+            m.logit_scale.data = torch.clamp(m.logit_scale.data, 0, 4.6052)
 
         batch_time = time.time() - end
         end = time.time()
