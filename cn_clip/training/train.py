@@ -196,6 +196,13 @@ def train(model, data, epoch, optimizer, scaler, scheduler, args, global_trained
                     total_loss, acc = get_loss(model, images, texts, loss_img, loss_txt, args)
             
             model.backward(total_loss)  # DeepSpeed 反向传播
+            
+            # 梯度裁剪 (DeepSpeed 模式)
+            if args.grad_clip_norm is not None:
+                # DeepSpeed 提供了内置的梯度裁剪功能
+                # 但我们也可以手动裁剪以确保兼容性
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+            
             model.step()  # DeepSpeed 优化器步进，包含梯度累积和混合精度更新
         else:
             # 原有的 PyTorch DDP 模式
@@ -208,6 +215,12 @@ def train(model, data, epoch, optimizer, scaler, scheduler, args, global_trained
                         else:
                             total_loss, acc = get_loss(model, images, texts, loss_img, loss_txt, args)
                         scaler.scale(total_loss).backward()
+                        
+                        # 梯度裁剪 (AMP 模式)
+                        if args.grad_clip_norm is not None:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                        
                         scaler.step(optimizer)
                     scaler.update()
 
@@ -217,6 +230,11 @@ def train(model, data, epoch, optimizer, scaler, scheduler, args, global_trained
                     else:
                         total_loss, acc = get_loss(model, images, texts, loss_img, loss_txt, args)
                     total_loss.backward()
+                    
+                    # 梯度裁剪 (FP32 模式)
+                    if args.grad_clip_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                    
                     optimizer.step()
             else:
                 # First, cache the features without any gradient tracking.
@@ -262,9 +280,18 @@ def train(model, data, epoch, optimizer, scaler, scheduler, args, global_trained
                         total_loss.backward()
 
                 if args.precision == "amp":
+                    # 梯度裁剪 (AMP + 梯度累积模式)
+                    if args.grad_clip_norm is not None:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                    
                     scaler.step(optimizer)
                     scaler.update()
                 else:
+                    # 梯度裁剪 (FP32 + 梯度累积模式)
+                    if args.grad_clip_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                    
                     optimizer.step()
 
         # reset gradient accum, if enabled (仅在 DDP 模式下需要手动重置)

@@ -228,6 +228,10 @@ def parse_args():
     parser.add_argument('--deepspeed', action='store_true', help='Enable DeepSpeed training.')
     parser.add_argument('--deepspeed_config', type=str, default=None,
                         help='Path to DeepSpeed config file. Default to Chinese-CLIP/configs/ds_config.json if --deepspeed is enabled and this is not specified.')
+    
+    # 梯度裁剪参数
+    parser.add_argument('--grad-clip-norm', type=float, default=None,
+                        help='Gradient clipping norm. If specified, gradients will be clipped to this norm. Recommended value: 1.0')
 
     args = parser.parse_args()
     args.aggregate = not args.skip_aggregate
